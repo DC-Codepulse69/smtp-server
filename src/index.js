@@ -1,5 +1,6 @@
 import "./envLoad.js";
 
+import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 
@@ -9,8 +10,79 @@ import { simpleParser } from "mailparser";
 
 const SMTP_PORT = Number(process.env.SMTP_PORT || 25);
 const MAX_MESSAGE_SIZE = 25 * 1024 * 1024; // 25 MB
+const EMAIL_DIR = path.resolve("./emails");
+const PROCESSED_EMAILS_FILE = path.join(
+    EMAIL_DIR,
+    ".processed-email-requests"
+);
+const processedEmailKeys = new Set();
+let processedEmailKeysLoaded = false;
 
 import axios from "axios";
+
+function getEmailKey(rawEmail, messageId) {
+    const identity = messageId
+        ? `message-id:${messageId}`
+        : `raw-email:${crypto
+            .createHash("sha256")
+            .update(rawEmail)
+            .digest("hex")}`;
+
+    return crypto
+        .createHash("sha256")
+        .update(identity)
+        .digest("hex");
+}
+
+async function claimEmail(rawEmail, messageId) {
+    if (!processedEmailKeysLoaded) {
+        try {
+            const entries = await fs.readFile(
+                PROCESSED_EMAILS_FILE,
+                "utf8"
+            );
+
+            for (const entry of entries.split("\n")) {
+                if (entry) {
+                    processedEmailKeys.add(entry);
+                }
+            }
+        } catch (err) {
+            if (err.code !== "ENOENT") {
+                throw err;
+            }
+        }
+
+        processedEmailKeysLoaded = true;
+    }
+
+    const emailKey = getEmailKey(rawEmail, messageId);
+
+    if (processedEmailKeys.has(emailKey)) {
+        return false;
+    }
+
+    // Claim before making the API request. This intentionally prevents an
+    // SMTP retry after an API error from sending the request a second time.
+    processedEmailKeys.add(emailKey);
+
+    try {
+        await fs.mkdir(EMAIL_DIR, {
+            recursive: true
+        });
+
+        await fs.appendFile(
+            PROCESSED_EMAILS_FILE,
+            `${emailKey}\n`,
+            "utf8"
+        );
+    } catch (err) {
+        processedEmailKeys.delete(emailKey);
+        throw err;
+    }
+
+    return true;
+}
 
 // const VALID_RECIPIENTS = new Set([
 //     "admin@example.com",
@@ -64,6 +136,16 @@ const smtpServer = new SMTPServer({
     },
 
     async onData(stream, session, callback) {
+        let callbackCalled = false;
+        const complete = err => {
+            if (callbackCalled) {
+                return;
+            }
+
+            callbackCalled = true;
+            callback(err);
+        };
+
         try {
             const chunks = [];
 
@@ -71,9 +153,13 @@ const smtpServer = new SMTPServer({
                 chunks.push(chunk);
             });
 
-            stream.on("error", callback);
+            stream.on("error", complete);
 
             stream.on("end", async () => {
+                if (callbackCalled) {
+                    return;
+                }
+
                 try {
                     const rawEmail = Buffer.concat(chunks);
 
@@ -83,14 +169,12 @@ const smtpServer = new SMTPServer({
                             .toString(36)
                             .slice(2)}.eml`;
 
-                    const emailDir = path.resolve("./emails");
-
-                    await fs.mkdir(emailDir, {
+                    await fs.mkdir(EMAIL_DIR, {
                         recursive: true
                     });
 
                     await fs.writeFile(
-                        path.join(emailDir, fileName),
+                        path.join(EMAIL_DIR, fileName),
                         rawEmail
                     );
 
@@ -143,6 +227,20 @@ const smtpServer = new SMTPServer({
                         )
                     );
 
+                    const claimed = await claimEmail(
+                        rawEmail,
+                        mail.messageId
+                    );
+
+                    if (!claimed) {
+                        console.log(
+                            `[DUPLICATE EMAIL] Skipping API request for ${
+                                mail.messageId || "message without Message-ID"
+                            }`
+                        );
+                        return complete();
+                    }
+
                     await axios.post(
                         `${process.env.API_URL || "http://localhost:3000"}/api/new-email`,
                         parsedMail
@@ -150,18 +248,18 @@ const smtpServer = new SMTPServer({
 
                     // Save to DB here
 
-                    callback();
+                    complete();
                 } catch (err) {
                     console.error(
                         "[PROCESS EMAIL ERROR]",
                         err
                     );
 
-                    callback(err);
+                    complete(err);
                 }
             });
         } catch (err) {
-            callback(err);
+            complete(err);
         }
     }
 });
